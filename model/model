@@ -71,7 +71,7 @@ class MiniMindConfig(PretrainedConfig):
             else None
         )
 
-class RMSNorm(nn..module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-05):
         super().__init__()
         self.dim = dim
@@ -79,7 +79,7 @@ class RMSNorm(nn..module):
         self.weight = nn.Parameter(torch.ones(dim))
     
     def _norm(self, x):
-        return toorch.rsqurt(x.pow(2).meam(-1, keepdim=True)+self.eps) * x
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * x
     
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
