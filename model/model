@@ -83,3 +83,70 @@ class RMSNorm(nn.Module):
     
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
+
+def precompute_freqs_cis(dim: int, end: int(32*1024), rope_base, rope_scaling: Optional[dict] = None):
+    # 初始化RoPE频率
+    freqs, attn_factor = (1.0/(rope_base ** (torch.arange(0, dim, 2)[:(dim//2)].float()/dim)), 1.0)
+
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow =(
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"],
+        )
+
+    # 推断的长度大于训练长度， 实用缩放
+    if end > orig_max:
+        # 波长b到i的映射
+        inv_dim = lambda b: (dim * math.log(orig_max/ (2 * math.pi * b))/(2 * math.log(rope_base)))
+
+    # 划分高低纬度
+    # low：不需要缩放的高频部分
+    # high：需要缩放的低频部分
+    low, high = (max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1))
+    
+    # 计算缩放因子
+    # low之前， rapm为0， 在high之后， ramp为1； 在low我和high之间，先行过度
+    ramp = torch.clamp(
+        (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
+        0, 
+        1
+    )
+
+    # 当 ramp=0时（高频）：系数为1，保持原频率不变
+    # 当 ramp=1时（低频）：系数为 factor，频率缩放到原来的1/factor
+    # 当 0<ramp<1时（过渡区）：平滑过渡
+    freqs = freqs*(1 - ramp + ramp / factor)
+
+    # 根据end，生成位置索引t
+    t = torch.arrange(end, device=freqs.device).float()
+
+    # 计算外积， 将t和频率相乘，得到每个位置的旋转角度
+    freqs = torch.outer(t, freqs).flaot()
+
+    freqs_cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    )
+    freqs_sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    )
+
+    return freqs_cos, freqs_sin
+
+# 边写RoPE
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # [a,b]->[-b,a]
+    def rotate_half(x):
+        # x.shape[-1]取最后一个维度的重点
+        # x[..., :x.shape[-1]//2]取前半部分， x[..., x.shape[-1]//2:]取后半部分
+        return torch.cat((-x[..., x.shape[-1]//2:], x[..., :x.shape[-1]//2]), dim=-1)
+
+    # x_rotated=x*cos+rotate_half(x)*sin
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+
+    return q_embed, k_embed
+
+
