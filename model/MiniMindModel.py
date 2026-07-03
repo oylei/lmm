@@ -71,6 +71,15 @@ class MiniMindConfig(PretrainedConfig):
             else None
         )
 
+import torch
+import torch.nn as nn
+import math
+from typing import Optional, Tuple, List, Union
+from torch.nn import functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-05):
         super().__init__()
@@ -123,7 +132,7 @@ def precompute_freqs_cis(dim: int, end: int(32*1024), rope_base, rope_scaling: O
     t = torch.arrange(end, device=freqs.device).float()
 
     # 计算外积， 将t和频率相乘，得到每个位置的旋转角度
-    freqs = torch.outer(t, freqs).flaot()
+    freqs = torch.outer(t, freqs).flaot() 
 
     freqs_cos = (
         torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
@@ -168,7 +177,6 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0
 
         self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
         self.n_rep = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
@@ -187,7 +195,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        position_embadding; Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
@@ -200,7 +208,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
     # q和k，使用roPE
-        cos, sin = position_embadding
+        cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
     # 对于k和v，使用repeat（注意kv cache）
         if past_key_value is not None:
@@ -254,7 +262,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
         self.act_fn = ACT2FN[args.hidden_act]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         return self.dropout(
             self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
             )
@@ -272,7 +280,7 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config)
        
-    def forward(self,hidden_states, position_embaddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self,hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -291,7 +299,8 @@ class MiniMindBlock(nn.Module):
 
 class MiniMindModel(nn.Module):
     def __init__(self,config:MiniMindConfig):
-        super().__init__()
+        super().__init__() 
+        self.config = config
         self.vocab_size, self.num_hidden_layers=(
             config.vocab_size,
             config.num_hidden_layers
@@ -322,40 +331,83 @@ class MiniMindModel(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
-    batch_size, seq_len = input_ids.shape
-
-    if hasattr(past_key_values, "layers"):
-        past_key_values = None
-    
-    past_key_values = past_key_values or [None] * len(self.layers)
-
-    start_pos = (
-        past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-    )
-
-    hidden_states = self.dropout(self.embed_tokens(input_ids))
-
-    position_enmbeddings = (
-        self.freqs_cos[start_pos : start_pos + seq_len],
-        self.freqs_sin[start_pos : start_pos + seq_len],
-    )
-
-    presents = []
-
-    for layer_idx,(layer,apst_key_values) in enumerate(
-        zip(self.layers, past_key_values)
     ):
-        hidden_states, present = layer(
-            hidden_states,
-            position_enmbeddings,
-            past_key_value=apst_key_values,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
+        batch_size, seq_len = input_ids.shape
+
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+        
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
 
-        presents.append(present)
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
 
-    hidden_states = self.norm(hidden_states)
+        position_enmbeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_len],
+            self.freqs_sin[start_pos : start_pos + seq_len],
+        )
 
-    return hidden_states, presents
+        presents = []
+
+        for layer_idx,(layer,apst_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present = layer(
+                hidden_states,
+                position_enmbeddings,
+                past_key_value=apst_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, presents
+
+class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self, config:MiniMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+
+        # 权重共享
+        # 输出层的权重和输入嵌入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep:Union[int,torch.Tensor] = 0,
+        **kwargs,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )   
+        # logits to keep是整数，那就保留最后n个位置
+        # 生成的时候只需要最后的logits来预测下一个token
+        slice_indices = (
+            slice(-logits_to_keep, None) 
+            if isinstance(logits_to_keep, int) 
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+        )   
