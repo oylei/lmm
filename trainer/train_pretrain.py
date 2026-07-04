@@ -329,6 +329,8 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    Logger(f"数据集大小: {len(train_ds)} 条, 每epoch步数: {len(train_ds) // args.batch_size}")
+    Logger(f"开始训练, Epochs: {args.epochs}, 日志间隔: {args.log_interval}步")
     for epoch in range(start_epoch, args.epochs):
         # 📚 分布式采样器epoch设置
         # 每个epoch设置不同的随机种子，确保数据顺序随机化
