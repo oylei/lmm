@@ -310,7 +310,7 @@ class MiniMindModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.alyers = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [MiniMindBlock(layer_id=i, config=config) for i in range(self.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -391,6 +391,7 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         logits_to_keep:Union[int,torch.Tensor] = 0,
+        labels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         hidden_states, past_key_values = self.model(
@@ -399,17 +400,32 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
             past_key_values=past_key_values,
             use_cache=use_cache,
             **kwargs,
-        )   
+        )
         # logits to keep是整数，那就保留最后n个位置
         # 生成的时候只需要最后的logits来预测下一个token
         slice_indices = (
-            slice(-logits_to_keep, None) 
-            if isinstance(logits_to_keep, int) 
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        loss = None
+        aux_loss = None
+        if labels is not None:
+            # Shift: 用前n-1个位置预测后n-1个位置
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # 展平后计算交叉熵，ignore_index=-100 跳过PAD位置
+            loss = F.cross_entropy(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
         return CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             past_key_values=past_key_values,
-        )   
+            aux_loss=aux_loss,
+        )
