@@ -7,6 +7,7 @@ class MiniMindConfig(PretrainedConfig):
     def __init__(
         self,
         dropout: float = 0.0,
+        attention_dropout: float = 0.0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
@@ -35,6 +36,7 @@ class MiniMindConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.dropout = dropout
+        self.attention_dropout = attention_dropout
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.hidden_act = hidden_act
@@ -93,7 +95,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
 
-def precompute_freqs_cis(dim: int, end: int(32*1024), rope_base, rope_scaling: Optional[dict] = None):
+def precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base=None, rope_scaling: Optional[dict] = None):
     # 初始化RoPE频率
     freqs, attn_factor = (1.0/(rope_base ** (torch.arange(0, dim, 2)[:(dim//2)].float()/dim)), 1.0)
 
@@ -106,7 +108,7 @@ def precompute_freqs_cis(dim: int, end: int(32*1024), rope_base, rope_scaling: O
         )
 
     # 推断的长度大于训练长度， 使用缩放
-    if end > orig_max:
+    if rope_scaling is not None and end > orig_max:
         # 波长b到i的映射
         inv_dim = lambda b: (dim * math.log(orig_max/ (2 * math.pi * b))/(2 * math.log(rope_base)))
 
@@ -129,10 +131,10 @@ def precompute_freqs_cis(dim: int, end: int(32*1024), rope_base, rope_scaling: O
         freqs = freqs*(1 - ramp + ramp / factor)
 
     # 根据end，生成位置索引t
-    t = torch.arrange(end, device=freqs.device).float()
+    t = torch.arange(end, device=freqs.device).float()
 
     # 计算外积， 将t和频率相乘，得到每个位置的旋转角度
-    freqs = torch.outer(t, freqs).flaot() 
+    freqs = torch.outer(t, freqs).float()
 
     freqs_cos = (
         torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
@@ -256,7 +258,7 @@ class FeedForward(nn.Module):
         if args.intermediate_size is None:
             intermediate_size = int(args.hidden_size * 8 / 3)
             args.intermediate_size = 64*((intermediate_size+64-1)//64)
-        self.up_proj = nn.Liner(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
         self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.dropout = nn.Dropout(args.dropout)
