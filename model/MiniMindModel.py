@@ -284,7 +284,7 @@ class MiniMindBlock(nn.Module):
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),
-            position_embaddings,
+            position_embeddings,
             past_key_value=past_key_value,
             use_cache=use_cache,
             attention_mask=attention_mask,
