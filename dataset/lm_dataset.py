@@ -37,9 +37,5 @@ class PretrainDataset(Dataset):
         labels[labels == self.tokenizer.pad_token_id] = -100 # 将PAD token的标签设置为-100，告诉loss函数忽略这些位置
     # 需要编写attention_mask，告诉模型哪些位置是有效的，哪些位置是PAD
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long() # 非PAD位置为1，PAD位置为0
-    # 返回input_ids,  attention_mask，labels
-        return {
-            "input_ids": input_ids,    
-            "attention_mask": attention_mask,     
-            "labels": labels,
-        }
+    # 返回input_ids, labels, attention_mask（顺序要和train_epoch解包一致）
+        return input_ids, labels, attention_mask
