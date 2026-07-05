@@ -423,9 +423,10 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
                 ignore_index=-100,
             )
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
-            aux_loss=aux_loss,
         )
+        output.aux_loss = aux_loss
+        return output
