@@ -143,7 +143,7 @@ if __name__ == "__main__":
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
     parser.add_argument(
-        "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
+        "--epochs", type=int, default=2, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
@@ -156,7 +156,7 @@ if __name__ == "__main__":
         help="训练设备",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
 
     # ========== 训练策略参数 ==========
     parser.add_argument(
@@ -164,7 +164,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
+    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
 
     # ========== 模型架构参数 ==========
     parser.add_argument("--hidden_size", default=512, type=int, help="隐藏层维度")
@@ -184,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default="../dataset/pretrain_t2t_mini.jsonl",  # ！修正：原"dataset/..."缺少../前缀
         help="预训练数据路径",
     )
     parser.add_argument(
