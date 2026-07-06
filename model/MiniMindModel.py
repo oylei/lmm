@@ -76,6 +76,7 @@ class MiniMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
+from torch.nn import init
 from typing import Optional, Tuple, List, Union
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
@@ -107,28 +108,36 @@ def precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base=None, rope_scal
             rope_scaling["beta_slow"],
         )
 
-    # 推断的长度大于训练长度， 使用缩放
-    if rope_scaling is not None and end > orig_max:
-        # 波长b到i的映射
-        inv_dim = lambda b: (dim * math.log(orig_max/ (2 * math.pi * b))/(2 * math.log(rope_base)))
+            # 只有当要推断的长度大于原始训练长度时，才应用缩放
+        if end / orig_max > 1.0:
+            # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
+                2 * math.log(rope_base)
+            )
 
-        # 划分高低纬度
-        # low：不需要缩放的高频部分
-        # high：需要缩放的低频部分
-        low, high = (max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1))
-        
-        # 计算缩放因子
-        # low之前， rapm为0， 在high之后， ramp为1； 在low我和high之间，先行过度
-        ramp = torch.clamp(
-            (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
-            0, 
-            1
-        )
+            # 4. 计算高频区和低频区的维度切分点
+            # low: 不需要缩放的高频部分的最高索引
+            # high: 需要完全缩放的低频部分的最低索引
+            low, high = (
+                max(math.floor(inv_dim(beta_fast)), 0),
+                min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1),
+            )
 
-        # 当 ramp=0时（高频）：系数为1，保持原频率不变
-        # 当 ramp=1时（低频）：系数为 factor，频率缩放到原来的1/factor
-        # 当 0<ramp<1时（过渡区）：平滑过渡
-        freqs = freqs*(1 - ramp + ramp / factor)
+            # 5. 计算混合因子 γ (Ramp)
+            # 在 low 之前，ramp 为 0；在 high 之后，ramp 为 1；在 low 和 high 之间，线性过渡。
+            # clamp 函数限制了数值只能在 [0, 1] 之间。
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
+                0,
+                1,
+            )
+
+            # 6. 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+            # ramp在0-1之间时：平滑过渡。
+            freqs = freqs * (1 - ramp + ramp / factor)
 
     # 根据end，生成位置索引t
     t = torch.arange(end, device=freqs.device).float()
@@ -269,6 +278,170 @@ class FeedForward(nn.Module):
             self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
             )
 
+class MoEGate(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                ).div_(seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
+
+
+class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        # 专家层
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
+        )
+        # 门控层
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
+        # 使用门控机制选择专家
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        # 展开x以便处理
+        x = x.view(-1, x.shape[-1])
+
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            # 按照定义的num_experts_per_tok重复输入token
+            # 每个token安排num_experts_per_tok个专家处理
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # y是空张量，和x形状相同
+            y = torch.empty_like(x, dtype=x.dtype)
+            # 遍历所有专家
+            for i, expert in enumerate(self.experts):
+                # 找到所有指向专家i的token
+                # 然后将这些token输入专家i进行处理
+                # 最后将结果放回y对应位置
+                expert_out = expert(x[flat_topk_idx == i])
+                if expert_out.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                else:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
+            # 加权求和
+            # 最后的y意义是每个token经过专家处理后的加权结果
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        # 如果是推理阶段
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    # MoE推理方法
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 使用cache，创建一个和x形状相同的零张量
+        expert_cache = torch.zeros_like(x)
+        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
+        # 分拣
+        idxs = flat_expert_indices.argsort()
+        # 统计每个专家被分配到的token数量
+        # 打包
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算每个token对应的专家索引
+        token_idxs = idxs // self.config.num_experts_per_tok
+        # 对每个打包好的包进行处理
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前包的起始位置
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            # 取出当前包对应的专家
+            expert = self.experts[i]
+            # 取出token对应的原始id
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 取出token对应的数据
+            expert_tokens = x[exp_token_idx]
+            # 计算专家输出，一次性处理当前包的所有token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将结果散点加到缓存中对应位置
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id:int, config:MiniMindConfig):
         super().__init__()
@@ -280,7 +453,12 @@ class MiniMindBlock(nn.Module):
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
+        # self.mlp = FeedForward(config)
+        self.mlp = (
+            FeedForward(config)
+            if not config.use_moe
+            else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
+        )
        
     def forward(self,hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -369,7 +547,18 @@ class MiniMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents
+        aux_loss = sum(
+            [
+                layer.mlp.aux_loss
+                for layer in self.layers
+                if isinstance(
+                    layer.mlp, MoEFeedForward
+                )  # ！修正：原MoEFeedForaward拼写错误
+            ],
+            hidden_states.new_zeros(1).squeeze(),
+        )
+
+        return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
     config_class = MiniMindConfig
@@ -394,7 +583,7 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
         labels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states, past_key_values = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -411,14 +600,11 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
-        aux_loss = None
         if labels is not None:
-            # Shift: 用前n-1个位置预测后n-1个位置
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # 展平后计算交叉熵，ignore_index=-100 跳过PAD位置
             loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
+                shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
@@ -427,6 +613,7 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
+            hidden_states=hidden_states,
         )
         output.aux_loss = aux_loss
         return output
