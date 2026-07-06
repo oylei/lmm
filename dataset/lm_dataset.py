@@ -1,4 +1,5 @@
 from torch.utils.data import Dataset
+import json
 import torch
 import os
 import random
@@ -133,19 +134,20 @@ class SFTDataset(Dataset):
         - add_generation_prompt=False：不在末尾追加"请模型续写"的 prompt，
           因为训练时需要完整的 input+output 序列，而非开放续写。
         """
-        messages = conversations.copy()
-        tools = (
-            conversations[0]["functions"]
-            if (
-                conversations
-                and conversations[0]["role"] == "system"
-                and conversations[0].get("functions")
-            )
-            else None
-        )
+        messages = []
+        tools = None
+        for message in conversations:
+            message = dict(message)
+            if message.get("role") == "system" and message.get("tools"):
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            messages.append(message)
+    
         return self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, tools=tools, open_thinking=False
+            messages, tokenize=False, add_generation_prompt=False, tools=tools
         )
+        
 
     def generate_labels(self, input_ids):
         """

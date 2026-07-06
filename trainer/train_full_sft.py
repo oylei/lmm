@@ -13,7 +13,7 @@ from contextlib import nullcontext  # 上下文管理器
 from torch import optim, nn  # 优化器和神经网络模块
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
-from model.MiniMindModel import MokioMindConfig  # 模型配置
+from model.MiniMindModel import MiniMindConfig  # 模型配置
 from dataset.lm_dataset import SFTDataset  # 监督微调数据集
 from trainer.trainer_utils import (
     get_lr,
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     - Pretrain脚本中from_weight='none'表示从头开始
     """
     os.makedirs(args.save_dir, exist_ok=True)  # 确保保存目录存在
-    lm_config = MokioMindConfig(
+    lm_config = MiniMindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
