@@ -144,7 +144,7 @@ class SFTDataset(Dataset):
             else None
         )
         return self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, tools=tools
+            messages, tokenize=False, add_generation_prompt=False, tools=tools, open_thinking=False
         )
 
     def generate_labels(self, input_ids):
