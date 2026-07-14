@@ -124,7 +124,7 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
-        """
+        """ 
         将多轮对话转换为模型输入的字符串。
 
         特点：
